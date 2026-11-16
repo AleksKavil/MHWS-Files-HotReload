@@ -169,6 +169,7 @@ private:
     bool finish_in_place(const Job& job);
     void finish_cached(const Job& job);
     void cascade_cached(const Job& job);
+    void cascade_prefabs(const std::vector<const Job*>& jobs);
     uintptr_t refresh_meshes(const std::wstring& path, uintptr_t new_res, const TypeHandler& handler);
     void release_later(uintptr_t res);
     void release_deferred(bool all);

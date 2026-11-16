@@ -410,10 +410,32 @@ void HotReload::on_dependency_saved(const std::wstring& res_path) {
 // Reference relationships: the root object holds one reference to the resource; resource +0x88 points to the root object without holding it; the returned root object reference is its only reference.
 // While the plugin holds the new resource it must also hold the root object, otherwise the root object is reclaimed, resource +0x88 dangles, and the game later reads freed memory when it takes the resource from the cache
 // (observed 2026-11-07: reloading again after a cache-only update reported "old resource has no userdata root object"; after a tester saved HairAdjustList.user,
-// setting hair crashed in HairAdjustList.getParam reading _Style). When the plugin releases this resource, release_resource releases the root object as well
+// setting hair crashed in HairAdjustList.getParam reading _Style). When the plugin releases this resource, release_resource releases the root object as well.
+// The same holds for .user resources loaded by the game: whenever the plugin holds one (old resource during a reload, orphans), it also holds its root object (hold_userdata_root).
+// Holding only the resource kept it in the cache after the game released the root (e.g. the equipment preview switched the helmet away while a reload was loading),
+// and the next load of the path got a resource whose +0x88 pointed to a freed object (reproduced 2026-11-15: crash in HairAdjustList.getParam after putting the helmet back on)
 namespace {
+struct UserRoot {
+    uintptr_t root{};
+    uint32_t holds{}; // References to the resource held by the plugin (each released through release_resource)
+    bool owned{};     // Root reference returned by create_userdata (its only reference); otherwise an extra reference added by the plugin
+};
 std::mutex g_user_roots_mutex{};
-std::unordered_map<uintptr_t, uintptr_t> g_user_roots{}; // Resources created by the plugin through create_userdata -> root objects held by the plugin
+std::unordered_map<uintptr_t, UserRoot> g_user_roots{}; // .user resources held by the plugin -> root objects held with them
+}
+
+// Call after the plugin adds a reference to a via.UserDataResource: the root object is held for as long as the plugin holds the resource
+static void hold_userdata_root(uintptr_t res) {
+    constexpr uintptr_t USERDATA_ROOT = 0x88;
+    std::lock_guard lock{g_user_roots_mutex};
+    if (const auto it = g_user_roots.find(res); it != g_user_roots.end()) {
+        ++it->second.holds;
+        return;
+    }
+    uintptr_t root = 0;
+    if (!safe_read_ptr(res + USERDATA_ROOT, root) || !managed_object_safe(root)) return;
+    API::get()->sdk()->managed_object->add_ref((REFrameworkManagedObjectHandle)root);
+    g_user_roots[res] = UserRoot{root, 1, false};
 }
 
 // Resources swapped out by the plugin that are no longer in the cache table: the plugin holds their last reference (one per resource); reap_retired destroys them
@@ -423,8 +445,6 @@ std::mutex g_retired_mutex{};
 std::unordered_set<uintptr_t> g_retired{};
 }
 
-// The plugin drops one resource reference. If the count before the release is 2 (this one of the plugin + the one held by the root object), the plugin is dropping the last reference and the root object is released with it;
-// if there are other holders (another place in the plugin, a game holder) the root object is kept
 namespace {
 int64_t qpc_now() {
     LARGE_INTEGER c{};
@@ -441,6 +461,8 @@ double qpc_ms(int64_t ticks) {
 }
 }
 
+// The plugin drops one resource reference. For a .user resource tracked in g_user_roots, the root object held with it is released when the plugin's last hold goes away
+// (see the comments inside); resources no longer in the cache table are kept in g_retired until the plugin's reference is the last one
 static void release_resource(uintptr_t res) {
     if (res == 0) return;
     const auto& api = API::get();
@@ -448,10 +470,16 @@ static void release_resource(uintptr_t res) {
     {
         std::lock_guard lock{g_user_roots_mutex};
         if (const auto it = g_user_roots.find(res); it != g_user_roots.end()) {
-            uintptr_t refs = 0; // +0x28 resource reference count (int32)
-            if (safe_read_ptr(res + 0x28, refs) && (int32_t)(uint32_t)refs <= 2) {
-                root = it->second;
-                g_user_roots.erase(it);
+            auto& u = it->second;
+            if (u.holds > 0) --u.holds;
+            if (u.holds == 0) {
+                // A reference the plugin added itself is always released. The root returned by create_userdata is released only when nothing but the plugin and the root hold the resource,
+                // otherwise it is kept (possibly a small leak): someone else holding the resource may still read the root through +0x88
+                uintptr_t refs = 0; // +0x28 resource reference count (int32)
+                if (!u.owned || (safe_read_ptr(res + 0x28, refs) && (int32_t)(uint32_t)refs <= 2)) {
+                    root = u.root;
+                    g_user_roots.erase(it);
+                }
             }
         }
     }
@@ -533,9 +561,9 @@ static uintptr_t create_userdata_resource(uintptr_t old_res, const std::string& 
     {
         std::lock_guard lock{g_user_roots_mutex};
         if (const auto prev = g_user_roots.find(res); prev != g_user_roots.end()) {
-            api->sdk()->managed_object->release((REFrameworkManagedObjectHandle)prev->second);
+            api->sdk()->managed_object->release((REFrameworkManagedObjectHandle)prev->second.root);
         }
-        g_user_roots[res] = (uintptr_t)obj;
+        g_user_roots[res] = UserRoot{(uintptr_t)obj, 1, true};
     }
     return res;
 }
@@ -625,8 +653,10 @@ bool HotReload::start_job(Job& job) {
 
 
     job.old_ready = job_loaded(job, job.old_res);
+    const bool is_user = std::string_view{job.handler->resource_type} == "via.UserDataResource";
     if (!from_orphan) {
         api->sdk()->resource->add_ref((REFrameworkResourceHandle)job.old_res);
+        if (is_user) hold_userdata_root(job.old_res);
         if (!ResourceCache::evict(job.old_res)) {
             log("%s: failed to evict from the cache", path.c_str());
             release_resource(job.old_res);
@@ -643,6 +673,7 @@ bool HotReload::start_job(Job& job) {
             if (other == job.old_res || other == job.extra_old) continue;
             // After removal from the table the plugin holds the last reference (release_resource moves it into g_retired), otherwise it would not be destroyed when its users release it to 0 on the main thread
             api->sdk()->resource->add_ref((REFrameworkResourceHandle)other);
+            if (is_user) hold_userdata_root(other);
             if (ResourceCache::evict(other)) ++job.evicted_extra;
             release_resource(other);
         }
@@ -694,6 +725,10 @@ bool HotReload::start_job(Job& job) {
 
 void HotReload::commit_new(Job& j) {
     if (!j.old_in_cache) return;
+    // .user: the cache keeps pointing to the old resource until finish_cached knows whether the file changes were written into the data in use. On success the new resource is dropped,
+    // so the game must never get it: anything taken from it in the meantime (e.g. a preview hunter's HairAdjustController._AdjustList) would point to a root object freed with it
+    // (observed 2026-11-14 on a tester's machine: HairAdjustList.getParam read freed memory after the whole mod set was saved and the helmet was equipped in the equipment preview)
+    if (std::string_view{j.handler->resource_type} == "via.UserDataResource") return;
     j.old_in_cache = false;
     if (!ResourceCache::replace(j.old_res, j.new_res)) {
         log("  %s: the old resource is no longer in the cache (released or removed by the game); the new resource was not put in the cache, later loads read the disk again", narrow(j.path).c_str());
@@ -1025,6 +1060,17 @@ void HotReload::finish_jobs(std::vector<Job>& jobs) {
 
     // 2. Replace resource content in place (pfb); other types scan memory in the background and replace references on the main thread when done (see complete_scan)
     std::vector<Job> scan_jobs{};
+    // Prefabs still holding the old versions of the cache-only resources of this batch (.user excluded: checked in finish_cached only when it falls back to a cache-only update)
+    if (m_cfg.cascade) {
+        std::vector<const Job*> cached{};
+        for (const auto& j : finished) {
+            if (j.handler->cache_only && std::string_view{j.handler->resource_type} != "via.UserDataResource") cached.push_back(&j);
+        }
+        if (!cached.empty()) {
+            auto run = [&] { cascade_prefabs(cached); };
+            if (const auto code = seh_call(run); code != 0) log("  Error while looking up prefabs using the old resources (exception 0x%08lX), skipped", code);
+        }
+    }
     for (auto& j : finished) {
         if (j.handler->cache_only) {
             finish_cached(j);
@@ -2566,6 +2612,65 @@ void HotReload::update_motlist_versions(const Job& j) {
     if (!paths.empty()) log("  Referencing motlists: %zu, reloaded as well", paths.size());
 }
 
+// Prefabs loaded before the reload keep the old resource in their dependency array (PrefabResource +0x68 {pointer, count/capacity}, see prefab_live.cpp) and spawn objects
+// with it later. Example (observed 2026-11-15): a mod body was equipped while one texture referenced by its mdf2 was missing; the pfb took the mdf2 whose texture never finishes loading.
+// After the texture was added the mdf2 was reloaded into the cache, but the body spawned from the pfb still used the old mdf2 and stayed invisible, even after re-equipping.
+// Ready pfb resources in the cache whose dependency array contains the old resource are queued for reload: the new pfb takes its dependencies from the cache, and its content
+// (dependency array included) is swapped into the old pfb object in place (finish_in_place), so later spawns use the new resource.
+// .user: the pfb keeps the root objects of the .user files it references in a second array (+0x80 {pointer, count/capacity}; elements are via.UserData objects, checked 2026-11-15
+// on 572 loaded pfbs). Only a cache-only .user update gets here (when the file changes are written into the data in use the old root object itself is updated and nothing is cascaded)
+// One walk of the cache per batch (all cache-only jobs finished in the same frame are passed together); the walk compares vtables only (no path reads):
+// walking with a path filter cost about 13 ms per call (measured 2026-11-15), which added up to a long frame when a whole mod set was saved
+void HotReload::cascade_prefabs(const std::vector<const Job*>& jobs) {
+    constexpr uintptr_t PREFAB_DEPS = 0x68, PREFAB_DEPS_COUNT = 0x70, PREFAB_USERDATA = 0x80, PREFAB_USERDATA_COUNT = 0x88;
+    constexpr uintptr_t USERDATA_ROOT = 0x88;
+    static const auto pfb = handler_for_ext(L"pfb");
+    if (pfb == nullptr) return;
+    // Old resource (or old .user root object) -> path of the job that replaced it
+    std::unordered_map<uintptr_t, const std::wstring*> olds{}, old_roots{};
+    std::unordered_set<uintptr_t> skip{};
+    for (const auto j : jobs) {
+        if (j == nullptr || j->handler == pfb) continue;
+        const bool user = std::string_view{j->handler->resource_type} == "via.UserDataResource";
+        for (const auto r : {j->old_res, j->extra_old}) {
+            if (r == 0) continue;
+            olds.emplace(r, &j->path);
+            skip.insert(r);
+            uintptr_t root = 0;
+            if (user && safe_read_ptr(r + USERDATA_ROOT, root) && root != 0) old_roots.emplace(root, &j->path);
+        }
+    }
+    if (olds.empty()) return;
+    // PrefabResource vtable: taken once from the first .pfb entry in the cache (that lookup reads paths, but stops at the first match)
+    static uintptr_t pfb_vtable = 0;
+    if (pfb_vtable == 0) {
+        const auto first = ResourceCache::list(L".pfb", 1);
+        if (first.empty() || !lower(first.front().path).ends_with(L".pfb") || !safe_read_ptr(first.front().resource, pfb_vtable)) return;
+    }
+    // The element of the array {pointer at +arr_off, count at +count_off} of pfb res found in set (nullptr if none)
+    const auto array_hit = [](uintptr_t res, uintptr_t arr_off, uintptr_t count_off, const std::unordered_map<uintptr_t, const std::wstring*>& set) -> const std::wstring* {
+        uintptr_t arr = 0;
+        uint32_t count = 0;
+        if (set.empty() || !safe_read_ptr(res + arr_off, arr) || arr == 0 || !read_u32(res + count_off, count) || count == 0 || count > 4096) return nullptr;
+        for (uint32_t k = 0; k < count; ++k) {
+            uintptr_t v = 0;
+            if (!safe_read_ptr(arr + 8ull * k, v)) return nullptr;
+            if (const auto it = set.find(v); it != set.end()) return it->second;
+        }
+        return nullptr;
+    };
+    std::vector<std::pair<std::wstring, std::wstring>> hits{}; // {pfb path, path of the replaced resource}
+    for (const auto& e : ResourceCache::list(L"", SIZE_MAX, {pfb_vtable})) {
+        if (!e.ready || skip.contains(e.resource)) continue;
+        auto by = array_hit(e.resource, PREFAB_DEPS, PREFAB_DEPS_COUNT, olds);
+        if (by == nullptr) by = array_hit(e.resource, PREFAB_USERDATA, PREFAB_USERDATA_COUNT, old_roots);
+        if (by != nullptr) hits.emplace_back(e.path, *by);
+    }
+    if (hits.empty()) return;
+    log("  Loaded prefabs still using replaced resources: %zu, reloaded as well (objects spawned from them later use the new files)", hits.size());
+    for (const auto& [path, by] : hits) enqueue(path, pfb, L"dependency " + by);
+}
+
 // Dependency handling after texture/rtex/mmtr cache updates: mdf2 takes and holds textures/mmtr when it loads, so meshes spawned later through the cached mdf2 still use the old texture.
 // The mdf2 referencing it is queued for reload (the old mdf2 stays in the cache while loading; once loaded it is swapped in and scene meshes refreshed).
 // The mdf2 is not removed from the cache: a later game request would get the mdf2 still loading and set it on a mesh immediately, whose materials then never build and stay black (observed 2026-11-03).
@@ -2753,16 +2858,31 @@ void HotReload::finish_cached(const Job& j) {
         bool in_place = false;
         auto run = [&] { in_place = update_userdata(j); };
         if (const auto code = seh_call(run); code != 0) log("  Error while writing data in use (exception 0x%08lX), skipped", code);
-        if (in_place && ResourceCache::replace(j.new_res, j.old_res)) {
-            auto& held = m_cached[key];
-            if (held != 0) release_resource(held); // May be the old resource itself: an extra reference was added when the reload started
-            held = j.old_res;
+        // old_in_cache: commit_new left the old resource in the cache (see commit_new), the new one was never visible to the game
+        const bool old_still_cached = j.old_in_cache;
+        if (in_place && (old_still_cached || ResourceCache::replace(j.new_res, j.old_res))) {
+            // The plugin keeps no reference to the old resource: a .user resource lives only as long as its root object (the root holds the resource, resource +0x88 does not hold the root).
+            // Holding the resource without the root kept it in the cache after the game released the root, with +0x88 pointing to a freed object; the next load of the path
+            // (e.g. putting the helmet back on in the equipment preview) got that resource (observed 2026-11-15: "old resource has no userdata root object" after switching the helmet away)
+            if (const auto it = m_cached.find(key); it != m_cached.end()) {
+                release_resource(it->second); // May be the old resource itself (from an earlier cache-only update, with its root held by the plugin)
+                m_cached.erase(it);
+            }
+            release_resource(j.old_res);
             release_later(j.new_res);
             if (j.extra_old != 0) release_resource(j.extra_old);
             log("  %s: applied live (file changes written to the data the game is using)", narrow(j.path).c_str());
             return;
         }
-        if (in_place) log("  The cache no longer holds the new resource, handled as cache-only");
+        if (old_still_cached) {
+            // Writing failed (structure changed, file unreadable): fall back to a cache-only update, the new resource goes into the cache now
+            if (!ResourceCache::replace(j.old_res, j.new_res)) {
+                log("  %s: the old resource is no longer in the cache (released or removed by the game); the new resource was not put in the cache, later loads read the disk again",
+                    narrow(j.path).c_str());
+            }
+        } else if (in_place) {
+            log("  The cache no longer holds the new resource, handled as cache-only");
+        }
     }
     if (std::string_view{j.handler->resource_type} == "via.motion.MotionListResource") {
         auto run = [&] { update_motlist_versions(j); };
@@ -2780,6 +2900,11 @@ void HotReload::finish_cached(const Job& j) {
             if (!paths.empty()) log("  Referencing motlists: %zu, reloaded as well (motions started later use the new file)", paths.size());
             for (const auto& p : paths) enqueue(p, motlist, L"dependency " + j.path);
         }
+    }
+    // Other cache-only types were checked for the whole batch in finish_jobs; a .user gets here only when it fell back to a cache-only update
+    if (m_cfg.cascade && std::string_view{j.handler->resource_type} == "via.UserDataResource") {
+        auto run = [&] { cascade_prefabs({&j}); };
+        if (const auto code = seh_call(run); code != 0) log("  Error while looking up prefabs using the old resource (exception 0x%08lX), skipped", code);
     }
     auto& held = m_cached[key];
     const auto previous = held;
