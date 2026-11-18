@@ -5,6 +5,7 @@
 
 #include <reframework/API.hpp>
 
+#include "crash_trace.hpp"
 #include "log.hpp"
 
 namespace hr {
@@ -18,6 +19,17 @@ void log(const char* fmt, ...) {
     va_end(args);
 
     reframework::API::get()->log_info("[file_hotreload] %s", buf);
+}
+
+void log_disabled(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    reframework::API::get()->log_info("[file_hotreload] %s", buf);
+    crash_trace_note("%s", buf);
 }
 
 std::string narrow(const std::wstring& w) {

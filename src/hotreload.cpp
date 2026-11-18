@@ -176,12 +176,12 @@ bool HotReload::initialize() {
 
     std::string err{};
     if (!ResourceCache::validate(err)) {
-        log("Resource table validation failed, plugin disabled: %s", err.c_str());
+        log_disabled("Resource table validation failed, plugin disabled: %s", err.c_str());
         return false;
     }
     // Hard-coded resource object and cache table offsets: the plugin modifies the cache table and reference counts with them, so the whole plugin is disabled if verification fails
     if (std::string report{}; !ResourceCache::check_layout(report)) {
-        log("Layout check: %s; plugin disabled", report.c_str());
+        log_disabled("Layout check: %s; plugin disabled", report.c_str());
         return false;
     } else {
         log("Layout check: %s", report.c_str());
@@ -787,7 +787,7 @@ void HotReload::restart_effect_players(const ResMap& map) {
     static const auto get_state = player_t ? player_t->find_method("get_State") : nullptr;
     static const auto set_action = player_t ? player_t->find_method("set_Action") : nullptr;
     if (!get_scene || !find_components || !get_resource || !set_resource || !get_state || !set_action) {
-        log("EffectPlayer methods not found, skipping refresh");
+        log_disabled("EffectPlayer methods not found, skipping refresh");
         return;
     }
 
@@ -835,7 +835,7 @@ void HotReload::refresh_provider_data(const ResMap& map) {
     static const auto get_res = tdb->find_method("via.effect.ProviderData", "getResources(System.UInt64)");
     static const auto set_res = tdb->find_method("via.effect.ProviderData", "setResources(System.UInt64, via.effect.EffectResourceHolder)");
     if (!get_scene || !find_components || !get_res_count || !get_res || !set_res) {
-        log("ProviderData methods not found, skipping EPV data refresh");
+        log_disabled("ProviderData methods not found, skipping EPV data refresh");
         return;
     }
 
@@ -1324,7 +1324,29 @@ void HotReload::entry_body() {
     process_awaiting(false);
 }
 
+// Hooks in the loader are installed and retried there (about once per second, at most 60 times); once both are settled, record those it gave up on in the crash log
+static void check_loader_hooks() {
+    static bool done = false;
+    static uint32_t calls = 0;
+    if (done || calls++ % 60 != 0) return;
+    using StateFn = void (*)(int*, int*);
+    const auto m = GetModuleHandleW(L"file_hotreload.dll");
+    const auto fn = m ? (StateFn)GetProcAddress(m, "loader_hook_state") : nullptr;
+    if (fn == nullptr) { // Older loaders lack this export
+        done = true;
+        return;
+    }
+    int path_hash = 0, dstorage = 0;
+    fn(&path_hash, &dstorage);
+    if (path_hash == 0 || dstorage == 0) return;
+    done = true;
+    // The loader has already written the details to the REFramework log
+    if (path_hash < 0) crash_trace_note("Engine path hash function hook not installed: loose files added while the game runs take effect only after a restart");
+    if (dstorage < 0) crash_trace_note("DirectStorage file close compensation not installed: reference counts are not compensated when loose textures are closed");
+}
+
 void HotReload::on_frame() {
+    check_loader_hooks();
     frame_body();
 }
 
@@ -1597,7 +1619,7 @@ ResourceFinalizeFn resource_finalize_fn() {
             }
         }
         if (matches != 1) {
-            log("  Resource completion function not found (signature matched %d times); mdf2 referencing textures newly loaded while the game runs will not take effect", matches);
+            log_disabled("  Resource completion function not found (signature matched %d times); mdf2 referencing textures newly loaded while the game runs will not take effect", matches);
             return nullptr;
         }
         return (ResourceFinalizeFn)found;
@@ -1883,7 +1905,7 @@ uintptr_t HotReload::refresh_meshes(const std::wstring& path, uintptr_t new_res,
     const auto getter = is_mesh ? mm.get_mesh : mm.get_material;
     const auto setter = is_mesh ? mm.set_mesh : mm.set_material;
     if (!get_scene || !find_components || !getter || !setter) {
-        log("  Mesh methods not found, meshes already in use are not refreshed");
+        log_disabled("  Mesh methods not found, meshes already in use are not refreshed");
         return 0;
     }
     const bool can_keep = mm.materials_ok();
@@ -3175,6 +3197,21 @@ void HotReload::check_layouts() {
     if (!r.managed) {
         log("Managed object layout check failed, plugin disabled");
         m_failed = true;
+    }
+    // Failed checks and the features they disable also go to the crash log (kept across launches)
+    for (const auto& line : r.lines) {
+        if (line.find("FAILED") != std::string::npos) crash_trace_note("Layout check: %s", line.c_str());
+    }
+    if (!user_ok) crash_trace_note("Layout check: .user root objects: FAILED (sampled %u, mismatched: %u)", tested, bad);
+    std::string off{};
+    if (!r.managed) off += "whole plugin, ";
+    if (!r.components || !r.type_info || !r.component_flags) off += "pfb live writes, ";
+    if (!r.components) off += "component raw pointer rewriting, ";
+    if (!r.tdb_impl) off += "reference redirection after component rebuilds, ";
+    if (!m_userdata_layout_ok) off += ".user reload, ";
+    if (!off.empty()) {
+        off.resize(off.size() - 2);
+        crash_trace_note("Disabled after the layout check: %s", off.c_str());
     }
 }
 

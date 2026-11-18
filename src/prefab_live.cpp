@@ -109,7 +109,7 @@ DeserializeFn find_deserialize() {
                 }
             }
         }
-        log("RSZ deserialize function not found, pfb live parameter changes unavailable");
+        log_disabled("RSZ deserialize function not found, pfb live parameter changes unavailable");
         return nullptr;
     }();
     return fn;
@@ -3408,7 +3408,7 @@ void PrefabLive::install_tracking() {
     if (g_transform_child == 0 || g_transform_next == 0) log("Spawn records: could not get the child offsets from via.Transform.get_Child/get_Next, child objects are not recorded");
     const auto target = locate_instantiate();
     if (target == 0) {
-        log("Spawn records: prefab instantiate function not found (prologue mismatch), not recording");
+        log_disabled("Spawn records: prefab instantiate function not found (prologue mismatch), not recording");
         return;
     }
     // Trampoline: the original function's first 19 bytes + jmp [rip] -> original function +19
@@ -3427,7 +3427,7 @@ void PrefabLive::install_tracking() {
     *(uint64_t*)(patch + 6) = (uint64_t)&instantiate_detour;
     memset(patch + 14, 0x90, PATCH_LEN - 14);
     if (!patch_entry(target, patch)) {
-        log("Spawn records: cannot patch the instantiate function");
+        log_disabled("Spawn records: cannot patch the instantiate function");
         return;
     }
     g_inst_target = target;
@@ -5782,7 +5782,7 @@ static LiveApplyResult apply_impl(uintptr_t old_res, uintptr_t new_res, bool ver
         if (base != 0) {
             log("TDB type implementation table %llx", (unsigned long long)base);
         } else {
-            log("TDB type implementation table not found: references in other objects are not rewritten after rebuilding components");
+            log_disabled("TDB type implementation table not found: references in other objects are not rewritten after rebuilding components");
         }
         return base != 0;
     }();

@@ -63,6 +63,9 @@ constexpr const char* k_update_entries[] = {
 };
 FILETIME g_loaded_time{};
 uint64_t g_frame_count{};
+// Hook installation results for the core (loader_hook_state): 0 still retrying, 1 installed, -1 gave up after the last retry
+int g_path_hook_state = 0;
+int g_ds_state = 0;
 uint32_t g_generation{};
 
 // Turn off REFramework LooseTextureLoader's DisableTextureCache: when on, every load of a loose texture creates a new copy (dozens to hundreds of copies of the same texture); hot reload does not need it.
@@ -177,16 +180,21 @@ void on_update_behavior() {
     static bool hook_done = false;
     // The DirectStorage compensation is installed at initialization; on failure it is also retried about once per second, at most 60 times
     static int ds_tries = 0;
-    if (ds_tries < 60 && g_frame_count % 60 == 30 && !hr::dstorage_close_fix_install(g_param->functions->log_info, &log_silent)) {
-        if (++ds_tries == 60) hr::dstorage_close_fix_install(g_param->functions->log_info, g_param->functions->log_error);
-    } else if (g_frame_count % 60 == 30) {
-        ds_tries = 60;
+    if (ds_tries < 60 && g_frame_count % 60 == 30) {
+        if (hr::dstorage_close_fix_install(g_param->functions->log_info, &log_silent)) {
+            ds_tries = 60;
+            g_ds_state = 1;
+        } else if (++ds_tries == 60) {
+            g_ds_state = hr::dstorage_close_fix_install(g_param->functions->log_info, g_param->functions->log_error) ? 1 : -1;
+        }
     }
     if (!hook_done && hook_tries < 60 && g_frame_count % 60 == 0) {
         ++hook_tries;
         // Only report errors on the first and the last failure to avoid flooding the log
         hook_done = hr::loose_hook_install(g_param->functions->log_info,
                                            hook_tries == 1 || hook_tries == 60 ? g_param->functions->log_error : &log_silent);
+        if (hook_done) g_path_hook_state = 1;
+        else if (hook_tries == 60) g_path_hook_state = -1;
     }
 #ifdef FILE_HOTRELOAD_MERGED
     // Single-file build: the core code is in this DLL; initialize on the first update, no hot swapping
@@ -220,6 +228,12 @@ void on_update_behavior() {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) disable_texture_cache_option(module);
     return TRUE;
+}
+
+// Hook states for the core to record failures in its crash log (0 still retrying, 1 installed, -1 gave up); read on the main thread
+extern "C" __declspec(dllexport) void loader_hook_state(int* path_hash, int* dstorage) {
+    if (path_hash) *path_hash = g_path_hook_state;
+    if (dstorage) *dstorage = g_ds_state;
 }
 
 extern "C" __declspec(dllexport) void reframework_plugin_required_version(REFrameworkPluginVersion* version) {

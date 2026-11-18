@@ -2,11 +2,14 @@
 // writing them to reframework/data/file_hotreload_crash.log (each entry flushed immediately). The file is created only when the first such exception is
 // recorded, so normal sessions leave no file behind.
 // When the process terminates with STATUS_BAD_STACK (0xC0000028) neither REFramework nor WER writes a dump; this is the only way to locate the faulting thread and code
+// The same file also receives "feature disabled" notes (crash_trace_note), so a session without problems still leaves nothing behind.
+// When the file is opened for the first time in a core load and is larger than MAX_FILE_SIZE, it is renamed to file_hotreload_crash.prev.log (replacing the old one) first
 #include "crash_trace.hpp"
 
 #include <Windows.h>
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cwchar>
 #include <iterator>
@@ -33,6 +36,11 @@ struct Module {
 
 HANDLE g_file = INVALID_HANDLE_VALUE;
 wchar_t g_path[MAX_PATH]{};
+wchar_t g_prev_path[MAX_PATH]{};                  // Where an oversized log is moved before this core load's first record
+constexpr ULONGLONG MAX_FILE_SIZE = 1024ull * 1024; // 1 MB
+SRWLOCK g_note_lock = SRWLOCK_INIT;
+uint64_t g_note_hashes[64]{}; // Notes already written in this core load (by text), so repeated calls write each one once
+size_t g_note_count = 0;
 SYSTEMTIME g_loaded{};            // When this core was loaded (written as the session header before its first record)
 SRWLOCK g_open_lock = SRWLOCK_INIT; // Several threads may hit their first exception at the same time
 PVOID g_handler = nullptr;
@@ -63,11 +71,17 @@ int format_addr(char* out, size_t n, uintptr_t a) {
     return _snprintf_s(out, n, _TRUNCATE, "%llx", (unsigned long long)a);
 }
 
-// Create (or append to) the crash log on the first record of this core load, preceded by a session header line
+// Create (or append to) the crash log on the first record of this core load, preceded by a session header line;
+// a file already larger than MAX_FILE_SIZE is first renamed to the .prev file (replacing it), so at most two files of about 1 MB exist
 void open_file() {
     AcquireSRWLockExclusive(&g_open_lock);
     if (g_file == INVALID_HANDLE_VALUE && g_path[0] != 0) {
-        const auto h = CreateFileW(g_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (g_prev_path[0] != 0 && GetFileAttributesExW(g_path, GetFileExInfoStandard, &fa) &&
+            (((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) > MAX_FILE_SIZE) {
+            MoveFileExW(g_path, g_prev_path, MOVEFILE_REPLACE_EXISTING);
+        }
+        const auto h =CreateFileW(g_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE) {
             char buf[128];
             const auto len = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "==== %04d-%02d-%02d %02d:%02d:%02d core loaded, main thread %lu ====\r\n", g_loaded.wYear,
@@ -149,6 +163,11 @@ LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep) {
 void crash_trace_install(const wchar_t* path, void* self_module) {
     if (g_handler != nullptr) return;
     wcsncpy_s(g_path, path, _TRUNCATE);
+    // xxx.log -> xxx.prev.log
+    if (const auto len = wcslen(g_path); len > 4 && _wcsicmp(g_path + len - 4, L".log") == 0) {
+        wcsncpy_s(g_prev_path, g_path, len - 4);
+        wcscat_s(g_prev_path, L".prev.log");
+    }
     GetLocalTime(&g_loaded);
     g_main_tid = GetCurrentThreadId();
     // Order: 0 kernelbase, 1 this plugin's core (access violations inside these two are expected); the rest are used to label addresses
@@ -159,6 +178,30 @@ void crash_trace_install(const wchar_t* path, void* self_module) {
     add_module("reframework", GetModuleHandleW(L"dinput8.dll"));
     add_module("loader", GetModuleHandleW(L"file_hotreload.dll"));
     g_handler = AddVectoredExceptionHandler(1, on_exception);
+}
+
+void crash_trace_note(const char* fmt, ...) {
+    if (g_path[0] == 0 || fmt == nullptr) return;
+    char text[1024];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+    // Write each distinct text once per core load (some callers report the same failure every time a feature is used)
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = text; *p != 0; ++p) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    AcquireSRWLockExclusive(&g_note_lock);
+    bool seen = false;
+    for (size_t i = 0; i < g_note_count && !seen; ++i) seen = g_note_hashes[i] == h;
+    if (!seen && g_note_count < std::size(g_note_hashes)) g_note_hashes[g_note_count++] = h;
+    ReleaseSRWLockExclusive(&g_note_lock);
+    if (seen) return;
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    char buf[1100];
+    const int len = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "[%02d:%02d:%02d.%03d] %s\r\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, text);
+    write_line(buf, len);
 }
 
 void crash_trace_remove() {

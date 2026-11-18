@@ -118,7 +118,7 @@ Engine locate_engine() {
     // Instance dispatch
     const auto p = find_bytes(code, MAIN_LEN, {0xFF, 0x50, _, 0xF6, 0x40, _, _, 0x75, _, 0x48, 0x8B, 0x48, _, 0x48, 0x85, 0xC9, 0x75, _, 0x48, 0x8B, 0x0D});
     if (p == nullptr) {
-        log("[RSZ] Instance dispatch code not found in the main function");
+        log_disabled("[RSZ] Instance dispatch code not found in the main function");
         return e;
     }
     e.vt_get_type = p[2];
@@ -147,13 +147,13 @@ Engine locate_engine() {
         }
     }
     if (e.deser_off == 0 || managed == 0) {
-        log("[RSZ] Native dispatch function / managed deserialize function not found");
+        log_disabled("[RSZ] Native dispatch function / managed deserialize function not found");
         return e;
     }
     // Managed deserialization: mov rax,[rdi+NATIVE_BASE]; mov rcx,[rax+FIELDS]; test rcx,rcx; jnz; mov rcx,[rip+default]
     const auto m = find_bytes((const uint8_t*)managed, 0x100, {0x48, 0x8B, _, _, 0x48, 0x8B, 0x48, e.fields_off, 0x48, 0x85, 0xC9, 0x75, _, 0x48, 0x8B, 0x0D});
     if (m == nullptr) {
-        log("[RSZ] Native ancestor offset not found in the managed deserialize function");
+        log_disabled("[RSZ] Native ancestor offset not found in the managed deserialize function");
         return e;
     }
     e.native_base_off = m[3];
@@ -163,7 +163,7 @@ Engine locate_engine() {
     // Scope: inc dword ptr [rsi+DEPTH]; mov rcx,rsi; mov dl,1; call deserialize flag
     const auto s = find_bytes(code, MAIN_LEN, {0xFF, 0x46, _, 0x48, 0x89, _, 0xB2, 0x01, 0xE8});
     if (b == nullptr || s == nullptr) {
-        log("[RSZ] Thread context enter code not found in the main function");
+        log_disabled("[RSZ] Thread context enter code not found in the main function");
         return e;
     }
     e.ctx_refs = b[2];
@@ -174,7 +174,7 @@ Engine locate_engine() {
     const auto x = s - 0x13;
     if (x < code || x[0] != 0x48 || x[1] != 0x8B || x[4] != 0x48 || x[5] != 0x83 || x[6] != 0x78 || x[8] != 0x00 || x[9] != 0x74 || x[11] != 0x48 ||
         x[12] != 0x89 || x[14] != 0xE8) {
-        log("[RSZ] Managed exception check code not found in the main function");
+        log_disabled("[RSZ] Managed exception check code not found in the main function");
         return e;
     }
     e.exc_holder = x[3];
@@ -184,7 +184,7 @@ Engine locate_engine() {
     const auto t = find_bytes(code, MAIN_LEN, {0xFF, 0xC8, 0x89, _, e.ctx_refs, 0x85, 0xC0, 0x75, _, 0x48, 0x8B, _, _, 0x48, 0x83, _, _, 0x00, 0x0F, 0x85, _, _,
                                                _, _, 0x48, 0x89, _, 0xE8, _, _, _, _, 0x48, 0x89, _, 0xE8});
     if (t == nullptr) {
-        log("[RSZ] Thread context end code not found in the main function");
+        log_disabled("[RSZ] Thread context end code not found in the main function");
         return e;
     }
     e.ctx_gc = (CtxFn)call_target(t + 27);
